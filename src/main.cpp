@@ -19,13 +19,23 @@ const int echoPin = 18;   // Echo pin
 
 // TDS sensor configuration
 #define TDS_PIN 34        // ESP32 GPIO pin connected to TDS sensor
-#define TDS_RELAY_PIN 14  // GPIO pin for TDS relay control
 
 // Water level sensor configuration
 #define WATER_SENSOR_PIN 32  // ESP32 analog pin connected to water sensor
-#define WATER_RELAY_PIN 27   // GPIO pin for water level relay control
 #define DRY_VALUE 0          // Value when sensor is completely dry
 #define WET_VALUE 4095       // Value when sensor is completely wet (ESP32's ADC is 12-bit, 0-4095)
+
+// Water Circuit configuration
+#define drain_pump 21
+#define main_pump 19
+#define Power_Switch 17
+#define Maintenance_Switch 16
+
+// Fertiliser Control configuration
+#define fert_pump 5
+
+// Airflow Control configuration
+#define fan 18
 
 // WiFi credentials
 const char* ssid = "vivo x100";
@@ -377,30 +387,6 @@ int readWaterLevelSensor() {
   return waterLevelPercent;
 }
 
-void controlRelays() {
-  // Control TDS relay - turn on when TDS is below threshold
-  if (tdsValue < TDS_THRESHOLD) {
-    digitalWrite(TDS_RELAY_PIN, HIGH);  // Activate relay
-    tdsRelayStatus = true;
-    Serial.println("TDS Relay activated: TDS below threshold");
-  } else {
-    digitalWrite(TDS_RELAY_PIN, LOW);   // Deactivate relay
-    tdsRelayStatus = false;
-    Serial.println("TDS Relay deactivated: TDS above threshold");
-  }
-  
-  // Control Water Level relay - turn on when water level is below threshold
-  if (waterLevelPercent < WATER_LEVEL_THRESHOLD) {
-    digitalWrite(WATER_RELAY_PIN, HIGH);  // Activate relay
-    waterRelayStatus = true;
-    Serial.println("Water Relay activated: Water level below threshold");
-  } else {
-    digitalWrite(WATER_RELAY_PIN, LOW);   // Deactivate relay
-    waterRelayStatus = false;
-    Serial.println("Water Relay deactivated: Water level above threshold");
-  }
-}
-
 void sendToPostman() {
   // Check WiFi connection status
   if(WiFi.status() == WL_CONNECTED) {
@@ -486,6 +472,56 @@ void sendToPostman() {
   }
 }
 
+//WaterPump Control function
+void WaterPumpControl() {
+  bool powerState = digitalRead(Power_Switch) == LOW;
+  bool maintenanceState = digitalRead(Maintenance_Switch) == LOW;
+
+  if (maintenanceState) {
+    Serial.println("Maintenance Mode: Draining Water");
+    digitalWrite(main_pump, HIGH);  // Turn off main pump
+    digitalWrite(drain_pump, LOW);  // Turn on drain pump
+  } else if (powerState) {
+    Serial.println("Normal Operation: Main Pump On");
+    if (waterLevelPercent < WATER_LEVEL_THRESHOLD) {
+      Serial.println("Water Level Low: Activating Main Pump");
+      digitalWrite(main_pump, LOW);  // Turn on main pump
+    } else {
+      Serial.println("Water Level Sufficient: Activating Drain Pump");
+      digitalWrite(main_pump, LOW);  // Keep main pump on
+      digitalWrite(drain_pump, LOW); // Turn on drain pump
+    }
+  } else {
+    Serial.println("System Off");
+    digitalWrite(main_pump, HIGH);  // Turn off main pump
+    digitalWrite(drain_pump, HIGH); // Turn off drain pump
+  }
+}
+
+//Fertiliser Control function
+void FertiliserControl() {
+  // Control the fertiliser pump based on TDS value
+  if (tdsValue < TDS_THRESHOLD) {
+    digitalWrite(fert_pump, LOW); // Turn on fertiliser pump
+    Serial.println("Fertiliser Pump ON: TDS below threshold");
+  } else {
+    digitalWrite(fert_pump, HIGH); // Turn off fertiliser pump
+    Serial.println("Fertiliser Pump OFF: TDS above threshold");
+  }
+}
+
+//Airflow Control function
+void AirflowControl() {
+  // Control the fan based on temperature and humidity
+  if (humidity > HUMIDITY_THRESHOLD) {
+    digitalWrite(fan, LOW); // Turn on fan
+    Serial.println("Fan ON: High temperature or humidity detected");
+  } else {
+    digitalWrite(fan, HIGH); // Turn off fan
+    Serial.println("Fan OFF: Temperature and humidity normal");
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   delay(1000);
@@ -498,13 +534,23 @@ void setup() {
   pinMode(trigPin, OUTPUT);
   pinMode(echoPin, INPUT);
   Serial.println("Ultrasonic sensor initialized");
-  
-  // Set up relay pins
-  pinMode(TDS_RELAY_PIN, OUTPUT);
-  pinMode(WATER_RELAY_PIN, OUTPUT);
-  digitalWrite(TDS_RELAY_PIN, LOW); // Initialize relay to OFF
-  digitalWrite(WATER_RELAY_PIN, LOW); // Initialize relay to OFF
-  Serial.println("Relays initialized");
+
+  // Set up Water circuit pins
+  pinMode(main_pump, OUTPUT);
+  pinMode(drain_pump, OUTPUT);
+  pinMode(Power_Switch, INPUT_PULLUP);
+  pinMode(Maintenance_Switch, INPUT_PULLUP);
+
+  digitalWrite(main_pump, HIGH);
+  digitalWrite(drain_pump, HIGH);
+
+  // Set Up Fertiliser circuit pins
+  pinMode(fert_pump, OUTPUT);
+  digitalWrite(fert_pump, HIGH); // Initialize relay to OFF
+
+  // Set Up Airflow Circuit pins
+  pinMode(fan, OUTPUT);
+  digitalWrite(fan, LOW);
   
   // Connect to WiFi
   WiFi.begin(ssid, password);
@@ -613,8 +659,6 @@ void loop() {
   tdsAlert = tdsValue < TDS_THRESHOLD;
   waterLevelAlert = waterLevelPercent < WATER_LEVEL_THRESHOLD;
   
-  // Control relays based on sensor values
-  controlRelays();
   
   // Send data to Postman every 30 seconds
   static unsigned long lastPostmanSend = 0;
@@ -626,6 +670,13 @@ void loop() {
     lastPostmanSend = currentMillis;
   }
   
+  // Control water pumps based on switches
+  WaterPumpControl();
+  // Control fertiliser pump based on TDS value
+  FertiliserControl();
+  // Control Fan based on temperature and humidity
+  AirflowControl();
+
   // Small delay between sensor readings
   delay(5000);
 }
