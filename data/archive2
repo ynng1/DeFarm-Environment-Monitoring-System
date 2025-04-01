@@ -1,0 +1,336 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <esp_wifi.h>
+#include "DHT.h"
+
+// Water sensor configuration
+#define WATER_SENSOR_PIN 35  // ESP32 analog pin connected to water sensor
+#define DRY_VALUE 0          // Value when sensor is completely dry
+#define WET_VALUE 4095       // Value when sensor is completely wet (ESP32's ADC is 12-bit, 0-4095)
+
+// DHT sensor configuration
+#define DHTPIN 4             // Digital pin connected to the DHT sensor
+#define DHTTYPE DHT11        // DHT 11
+#define TEMP_THRESHOLD 27.0  // Temperature threshold in Celsius
+#define HUMID_THRESHOLD 70.0 // Humidity threshold in percentage
+
+// WiFi credentials
+const char* ssid = "vivo x100";
+const char* password = "modify12";
+
+// Static IP configuration
+IPAddress staticIP(192, 168, 1, 200);     // Your desired static IP
+IPAddress gateway(192, 168, 1, 1);        // Your router's IP
+IPAddress subnet(255, 255, 255, 0);       // Subnet mask
+IPAddress dns(192, 168, 1, 1);            // Using router as DNS
+
+// HTTP server endpoint
+const char* serverUrl = "https://postman-echo.com/post";  // Replace with your actual endpoint
+
+// WiFi connection parameters
+#define MAX_WIFI_ATTEMPTS 10              // Maximum number of connection attempts
+#define WIFI_TIMEOUT 10000                // Connection timeout in milliseconds
+
+// Deep sleep parameters
+#define SLEEP_DURATION_SECONDS 30       // Sleep for 5 minutes (300 seconds) between readings
+
+// Store data in RTC memory to persist during sleep
+RTC_DATA_ATTR wifi_auth_mode_t authMode = WIFI_AUTH_OPEN;
+RTC_DATA_ATTR uint8_t channel = 0;
+RTC_DATA_ATTR uint8_t bssid[6];
+RTC_DATA_ATTR bool savedWiFiDetails = false;
+RTC_DATA_ATTR int bootCount = 0;          // Count number of boots/wakeups
+RTC_DATA_ATTR time_t lastReportTime = 0;  // Last time data was reported
+
+// Initialize the DHT sensor
+DHT dht(DHTPIN, DHTTYPE);
+
+// Sensor data structure
+struct SensorData {
+  int waterLevelRaw;
+  int waterLevelPercent;
+  float temperature;
+  float humidity;
+  bool tempAlert;
+  bool humidAlert;
+  char timestamp[24];
+};
+
+// Function declarations
+bool connectToWiFi(unsigned long timeout);
+bool sendHttpPost(SensorData data);
+void disconnectWiFi();
+void readWaterSensor(int* rawValue, int* percentValue);
+bool readDHTSensor(float* temperature, float* humidity);
+void generateTimestamp(char* timestamp);
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);  // Give time for serial to connect
+  
+  // Increment boot count
+  bootCount++;
+  Serial.println("Boot number: " + String(bootCount));
+  
+  // Initialize sensors
+  pinMode(WATER_SENSOR_PIN, INPUT);
+  dht.begin();
+
+  // Structure to hold all sensor data
+  SensorData sensorData;
+  
+  // Read water sensor data
+  readWaterSensor(&sensorData.waterLevelRaw, &sensorData.waterLevelPercent);
+  
+  // Print water sensor values to serial
+  Serial.print("Water Level Raw Value: ");
+  Serial.print(sensorData.waterLevelRaw);
+  Serial.print("\tWater Level: ");
+  Serial.print(sensorData.waterLevelPercent);
+  Serial.println("%");
+  
+  // Read temperature and humidity
+  bool dhtSuccess = readDHTSensor(&sensorData.temperature, &sensorData.humidity);
+  
+  if (dhtSuccess) {
+    // Check for alerts
+    sensorData.tempAlert = (sensorData.temperature >= TEMP_THRESHOLD);
+    sensorData.humidAlert = (sensorData.humidity >= HUMID_THRESHOLD);
+    
+    // Print DHT values to serial
+    Serial.print("Temperature: ");
+    Serial.print(sensorData.temperature, 1);
+    Serial.print("°C\tHumidity: ");
+    Serial.print(sensorData.humidity, 1);
+    Serial.println("%");
+    Serial.print("Temp Alert: ");
+    Serial.print(sensorData.tempAlert ? "YES" : "NO");
+    Serial.print("\tHumidity Alert: ");
+    Serial.println(sensorData.humidAlert ? "YES" : "NO");
+  } else {
+    Serial.println("Failed to read from DHT sensor!");
+    // Set default values
+    sensorData.temperature = -999.0;
+    sensorData.humidity = -999.0;
+    sensorData.tempAlert = false;
+    sensorData.humidAlert = false;
+  }
+  
+  // Generate timestamp
+  generateTimestamp(sensorData.timestamp);
+  Serial.print("Timestamp: ");
+  Serial.println(sensorData.timestamp);
+  
+  // Attempt to connect to WiFi and send data
+  if (connectToWiFi(WIFI_TIMEOUT)) {
+    // WiFi connected successfully, send HTTP POST
+    bool postSuccess = sendHttpPost(sensorData);
+    if (postSuccess) {
+      Serial.println("HTTP POST successful");
+      lastReportTime = time(NULL); // Update last successful report time
+    } else {
+      Serial.println("HTTP POST failed");
+    }
+    
+    // Save WiFi details for faster reconnection next time
+    if (!savedWiFiDetails) {
+      wifi_config_t conf;
+      esp_wifi_get_config(WIFI_IF_STA, &conf);
+      authMode = conf.sta.threshold.authmode;
+      channel = conf.sta.channel;
+      memcpy(bssid, conf.sta.bssid, sizeof(bssid));
+      savedWiFiDetails = true;
+      Serial.println("Saved WiFi details for faster reconnection");
+    }
+    
+    // Disconnect WiFi to save power
+    disconnectWiFi();
+  } else {
+    Serial.println("WiFi connection failed, cannot send HTTP POST");
+  }
+  
+  // Prepare for deep sleep
+  Serial.println("Going to sleep for " + String(SLEEP_DURATION_SECONDS) + " seconds...");
+  esp_sleep_enable_timer_wakeup(SLEEP_DURATION_SECONDS * 1000000); // Convert to microseconds
+  esp_deep_sleep_start();
+}
+
+void loop() {
+  // This will never execute due to deep sleep
+}
+
+void readWaterSensor(int* rawValue, int* percentValue) {
+  // Read the analog value from the water sensor
+  *rawValue = analogRead(WATER_SENSOR_PIN);
+  
+  // Convert to a percentage
+  *percentValue = map(*rawValue, DRY_VALUE, WET_VALUE, 0, 100);
+  
+  // Ensure the percentage is within valid range
+  *percentValue = constrain(*percentValue, 0, 100);
+}
+
+bool readDHTSensor(float* temperature, float* humidity) {
+  // Read humidity
+  *humidity = dht.readHumidity();
+  
+  // Read temperature as Celsius
+  *temperature = dht.readTemperature();
+  
+  // Check if any reads failed
+  if (isnan(*humidity) || isnan(*temperature)) {
+    return false;
+  }
+  
+  return true;
+}
+
+void generateTimestamp(char* timestamp) {
+  // Create a simple timestamp based on boot count and millis
+  // In a real application, you'd use NTP to get accurate time
+  unsigned long uptimeSeconds = millis() / 1000;
+  sprintf(timestamp, "Boot%d-Uptime%lus", bootCount, uptimeSeconds);
+}
+
+bool connectToWiFi(unsigned long timeout) {
+  Serial.println("Connecting to WiFi...");
+  
+  // Set static IP configuration
+  if (!WiFi.config(staticIP, gateway, subnet, dns)) {
+    Serial.println("Static IP configuration failed");
+  }
+  
+  // Optimize WiFi power usage
+  WiFi.setSleep(true);
+  
+  // Start WiFi with minimal power
+  WiFi.mode(WIFI_STA);
+  
+  // Attempt quick connect if we have saved WiFi details
+  if (savedWiFiDetails) {
+    Serial.println("Using saved WiFi details for quick connect");
+    wifi_config_t conf;
+    esp_wifi_get_config(WIFI_IF_STA, &conf);
+    
+    // Set saved parameters
+    memcpy(conf.sta.bssid, bssid, sizeof(bssid));
+    conf.sta.channel = channel;
+    conf.sta.threshold.authmode = authMode;
+    conf.sta.bssid_set = 1;  // Tell WiFi to use the specific BSSID
+    
+    esp_wifi_set_config(WIFI_IF_STA, &conf);
+  }
+  
+  // Begin WiFi connection
+  WiFi.begin(ssid, password);
+  
+  // Wait for connection with timeout and max attempts
+  unsigned long startAttemptTime = millis();
+  int attempts = 0;
+  
+  while (WiFi.status() != WL_CONNECTED && 
+         millis() - startAttemptTime < timeout && 
+         attempts < MAX_WIFI_ATTEMPTS) {
+    delay(100);
+    Serial.print(".");
+    attempts++;
+  }
+  Serial.println();
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("Connected to WiFi in ");
+    Serial.print((millis() - startAttemptTime));
+    Serial.println(" ms");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+    return true;
+  } else {
+    Serial.println("Failed to connect to WiFi");
+    if (attempts >= MAX_WIFI_ATTEMPTS) {
+      Serial.println("Max connection attempts reached");
+    }
+    if (millis() - startAttemptTime >= timeout) {
+      Serial.println("Connection timeout");
+    }
+    return false;
+  }
+}
+
+bool sendHttpPost(SensorData data) {
+  HTTPClient http;
+  
+  Serial.print("Connecting to server: ");
+  Serial.println(serverUrl);
+  
+  // Configure timeout for slower connections
+  http.setTimeout(10000); // 10 seconds
+  
+  // For HTTPS connections we need to use WiFiClientSecure
+  WiFiClientSecure *client = new WiFiClientSecure;
+  
+  // Skip certificate verification (for testing only)
+  // Remove this for production and use proper certificate validation
+  client->setInsecure();
+  
+  // Begin HTTP connection with secure client
+  http.begin(*client, serverUrl);
+  
+  // Add headers
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Device-Name", "ESP32-Environmental-Monitor");
+  
+  // Create the JSON payload with all sensor data
+  String jsonPayload = "{";
+  jsonPayload += "\"device_id\":\"ESP32-001\",";
+  jsonPayload += "\"boot_count\":" + String(bootCount) + ",";
+  jsonPayload += "\"water_level_raw\":" + String(data.waterLevelRaw) + ",";
+  jsonPayload += "\"water_level_percent\":" + String(data.waterLevelPercent) + ",";
+  
+  // Add temperature and humidity data
+  if (data.temperature > -999.0) {  // Check if we have valid readings
+    jsonPayload += "\"temperature\":" + String(data.temperature, 1) + ",";
+    jsonPayload += "\"humidity\":" + String(data.humidity, 1) + ",";
+    jsonPayload += "\"temp_alert\":" + String(data.tempAlert ? "true" : "false") + ",";
+    jsonPayload += "\"humidity_alert\":" + String(data.humidAlert ? "true" : "false") + ",";
+  }
+  
+  // Add battery/voltage info and timestamp
+  jsonPayload += "\"voltage\":" + String(analogReadMilliVolts(WATER_SENSOR_PIN) / 1000.0) + ",";
+  jsonPayload += "\"timestamp\":\"" + String(data.timestamp) + "\"";
+  jsonPayload += "}";
+  
+  Serial.print("Sending payload: ");
+  Serial.println(jsonPayload);
+  
+  // Send the POST request
+  int httpResponseCode = http.POST(jsonPayload);
+  
+  // Check for a successful response
+  if (httpResponseCode > 0) {
+    Serial.print("HTTP Response code: ");
+    Serial.println(httpResponseCode);
+    
+    // Read and print the response
+    String response = http.getString();
+    Serial.println("Response:");
+    Serial.println(response);
+    
+    http.end();
+    return true;
+  } else {
+    Serial.print("HTTP POST Error: ");
+    Serial.println(httpResponseCode);
+    http.end();
+    return false;
+  }
+}
+
+void disconnectWiFi() {
+  // Disconnect from WiFi and turn off radio to save power
+  Serial.println("Disconnecting WiFi...");
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  Serial.println("WiFi disconnected");
+}

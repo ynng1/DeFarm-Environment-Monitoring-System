@@ -1,0 +1,182 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <DHT.h>
+#include <ArduinoJson.h>
+
+// WiFi credentials
+const char* ssid = "Gedong Free WiFi";
+const char* password = "mynamejeff";
+
+// DHT11 sensor configuration
+#define DHTPIN 4      // Digital pin connected to the DHT sensor
+#define DHTTYPE DHT11 // DHT 11
+DHT dht(DHTPIN, DHTTYPE);
+
+// Ultrasonic sensor pin
+const int trigPin = 5;    // Trigger pin
+const int echoPin = 18;   // Echo pin
+
+// Server endpoint where data will be sent
+const char* serverName = "https://ba26-203-149-236-126.ngrok-free.app";
+
+// Fixed thresholds
+const float TEMP_THRESHOLD = 28.0;  // Celsius
+const float HUMIDITY_THRESHOLD = 70.0;  // Percentage
+
+// Timer for readings
+unsigned long previousMillis = 0;
+const unsigned long interval = 10000; // 30 seconds in milliseconds
+
+// Function prototypes
+void readAndSendSensorData();
+void setupWiFi();
+
+void setup() {
+  Serial.begin(115200);
+  dht.begin();
+  
+  // Connect to Wi-Fi
+  WiFi.begin(ssid, password);
+  Serial.println("Connecting to WiFi...");
+  
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  
+  Serial.println("");
+  Serial.println("WiFi connected");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+}
+
+void loop() {
+  unsigned long currentMillis = millis();
+  
+  // Check if it's time for a reading
+  if (currentMillis - previousMillis >= interval) {
+    previousMillis = currentMillis;
+    
+    // Check WiFi connection and reconnect if needed
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("WiFi connection lost. Reconnecting...");
+      WiFi.reconnect();
+      
+      // Wait for reconnection
+      int attempts = 0;
+      while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+        delay(500);
+        Serial.print(".");
+        attempts++;
+      }
+      
+      if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("\nWiFi reconnected");
+      } else {
+        Serial.println("\nWiFi reconnection failed");
+        return;
+      }
+    }
+    
+    readAndSendSensorData();
+  }
+}
+
+void readAndSendSensorData() {
+  // Read temperature and humidity
+  float temperature = dht.readTemperature();
+  float humidity = dht.readHumidity();
+  
+  // Add a small delay to ensure stable readings
+  delay(100);
+  
+  // Check if any reads failed and retry once
+  if (isnan(temperature) || isnan(humidity)) {
+    Serial.println("Failed to read from DHT sensor! Retrying...");
+    delay(1000);
+    temperature = dht.readTemperature();
+    humidity = dht.readHumidity();
+    
+    if (isnan(temperature) || isnan(humidity)) {
+      Serial.println("Second attempt failed. Skipping this reading.");
+      return;
+    }
+  }
+  
+  Serial.print("Temperature: ");
+  Serial.print(temperature);
+  Serial.println("°C");
+  Serial.print("Humidity: ");
+  Serial.print(humidity);
+  Serial.println("%");
+  
+  // Check if thresholds are exceeded
+  bool tempAlert = temperature > TEMP_THRESHOLD;
+  bool humidityAlert = humidity > HUMIDITY_THRESHOLD;
+  
+  // Create JSON document
+  JsonDocument doc;
+  doc["temperature"] = temperature;
+  doc["humidity"] = humidity;
+  doc["tempAlert"] = tempAlert;
+  doc["humidityAlert"] = humidityAlert;
+  doc["timestamp"] = millis();
+  doc["deviceId"] = "ESP32_DHT11_1"; // You can set a unique ID for your device
+  
+  // Serialize JSON to string
+  String jsonString;
+  serializeJson(doc, jsonString);
+  
+  // Send data to server if WiFi is connected
+  if (WiFi.status() == WL_CONNECTED) {
+    WiFiClientSecure *client = new WiFiClientSecure;
+    
+    if(client) {
+      // Completely skip certificate validation for testing
+      client->setInsecure();
+      
+      // Add connection timeout
+      client->setTimeout(15); // 15 seconds timeout
+      
+      HTTPClient https;
+      Serial.println("[HTTPS] Begin...");
+      
+      // More detailed connection debugging
+      Serial.print("Connecting to: ");
+      Serial.println(serverName);
+      
+      if (https.begin(*client, serverName)) {
+        https.addHeader("Content-Type", "application/json");
+        https.setReuse(false); // Don't reuse the connection
+        
+        Serial.println("[HTTPS] Sending POST...");
+        Serial.println(jsonString); // Print what we're sending
+        
+        int httpResponseCode = https.POST(jsonString);
+        
+        // Check response
+        if (httpResponseCode > 0) {
+          String response = https.getString();
+          Serial.print("[HTTPS] Response code: ");
+          Serial.println(httpResponseCode);
+          Serial.println("Response: " + response);
+        } else {
+          Serial.print("[HTTPS] POST failed, error: ");
+          Serial.println(https.errorToString(httpResponseCode));
+        }
+        
+        // Free resources
+        https.end();
+      } else {
+        Serial.println("[HTTPS] Unable to connect");
+      }
+      
+      delete client;
+    } else {
+      Serial.println("Unable to create client");
+    }
+  } else {
+    Serial.println("WiFi not connected. Data not sent.");
+  }
+}
