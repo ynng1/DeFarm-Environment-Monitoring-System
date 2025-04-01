@@ -341,6 +341,7 @@ String getFormattedTime() {
   return String(timeStringBuff);
 }
 
+//functions start here
 float readTDSSensor() {
   // Read the analog value from the TDS sensor
   int rawValue = analogRead(TDS_PIN);
