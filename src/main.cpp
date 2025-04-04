@@ -38,8 +38,8 @@ const int echoPin = 18;   // Echo pin
 #define fan 18
 
 // WiFi credentials
-const char* ssid = "vivo x100";
-const char* password = "modify12";
+const char* ssid = "hau";
+const char* password = "Chonghau1";
 
 // Postman Mock Server URL
 const char* serverUrl = "https://e978879b-215c-4bf4-b33b-a43a2e2ae70e.mock.pstmn.io/data";
@@ -48,7 +48,7 @@ const char* serverUrl = "https://e978879b-215c-4bf4-b33b-a43a2e2ae70e.mock.pstmn
 const float TEMP_THRESHOLD = 30.0;    // Temperature threshold in °C
 const float HUMIDITY_THRESHOLD = 70.0; // Humidity threshold in %
 const float DISTANCE_THRESHOLD = 10.0; // Distance threshold in cm
-const float TDS_THRESHOLD = 500.0;     // TDS threshold in ppm
+const float TDS_THRESHOLD = 267.5;     // TDS threshold in ppm
 const int WATER_LEVEL_THRESHOLD = 50;  // Water level threshold in %
 
 // NTP Server to get time
@@ -474,8 +474,9 @@ void sendToPostman() {
 
 //WaterPump Control function
 void WaterPumpControl() {
-  bool powerState = digitalRead(Power_Switch) == LOW;
+  // Read the state of the switches
   bool maintenanceState = digitalRead(Maintenance_Switch) == LOW;
+  bool powerState = digitalRead(Power_Switch) == LOW;
 
   if (maintenanceState) {
     Serial.println("Maintenance Mode: Draining Water");
@@ -483,14 +484,8 @@ void WaterPumpControl() {
     digitalWrite(drain_pump, LOW);  // Turn on drain pump
   } else if (powerState) {
     Serial.println("Normal Operation: Main Pump On");
-    if (waterLevelPercent < WATER_LEVEL_THRESHOLD) {
-      Serial.println("Water Level Low: Activating Main Pump");
-      digitalWrite(main_pump, LOW);  // Turn on main pump
-    } else {
-      Serial.println("Water Level Sufficient: Activating Drain Pump");
-      digitalWrite(main_pump, LOW);  // Keep main pump on
-      digitalWrite(drain_pump, LOW); // Turn on drain pump
-    }
+    digitalWrite(main_pump, LOW);  // Turn on main pump
+    digitalWrite(drain_pump, HIGH); // Turn off drain pump
   } else {
     Serial.println("System Off");
     digitalWrite(main_pump, HIGH);  // Turn off main pump
@@ -498,15 +493,54 @@ void WaterPumpControl() {
   }
 }
 
+//fertiliser control test
+// void FertiliserTest() {
+//   // Test the fertiliser pump
+//   digitalWrite(fert_pump, LOW); // Turn on pump
+//   Serial.println("Fertiliser Pump ON: Test mode");
+//   delay(1000); // Run for 1 second
+//   digitalWrite(fert_pump, HIGH); // Turn off pump
+//   Serial.println("Fertiliser Pump OFF: Test mode complete");
+// }
+
 //Fertiliser Control function
+enum FertiliserState {
+  IDLE,
+  DISPENSING,
+  MIXING
+};
+
+FertiliserState fertState = IDLE;
+unsigned long fertStateStartTime = 0;
+
 void FertiliserControl() {
-  // Control the fertiliser pump based on TDS value
-  if (tdsValue < TDS_THRESHOLD) {
-    digitalWrite(fert_pump, LOW); // Turn on fertiliser pump
-    Serial.println("Fertiliser Pump ON: TDS below threshold");
-  } else {
-    digitalWrite(fert_pump, HIGH); // Turn off fertiliser pump
-    Serial.println("Fertiliser Pump OFF: TDS above threshold");
+  unsigned long currentMillis = millis();
+
+  switch (fertState) {
+    case IDLE:
+      if (tdsValue < TDS_THRESHOLD) {
+        digitalWrite(fert_pump, LOW); // Turn on pump
+        Serial.println("Fertiliser Pump ON: TDS below threshold");
+        fertStateStartTime = currentMillis;
+        fertState = DISPENSING;
+      }
+      break;
+
+    case DISPENSING:
+      if (currentMillis - fertStateStartTime >= 2000) {
+        digitalWrite(fert_pump, HIGH); // Turn off pump
+        Serial.println("Fertiliser Pump OFF: 10s dispensing done");
+        fertStateStartTime = currentMillis;
+        fertState = MIXING;
+      }
+      break;
+
+    case MIXING:
+      if (currentMillis - fertStateStartTime >= 10000) {
+        Serial.println("Mixing complete. Ready to check TDS again.");
+        fertState = IDLE;
+      }
+      break;
   }
 }
 
@@ -554,17 +588,22 @@ void setup() {
   
   // Connect to WiFi
   WiFi.begin(ssid, password);
-  Serial.println("Connecting to WiFi...");
-  
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
+  Serial.print("Connecting to WiFi...");
+
+  unsigned long startAttemptTime = millis();
+
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 10000) {
     Serial.print(".");
+    delay(500);
   }
-  
-  Serial.println("");
-  Serial.println("WiFi connected");
-  Serial.print("IP address: ");
-  Serial.println(WiFi.localIP());
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("Connected to WiFi");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("Failed to connect. Continuing offline...");
+  }
   
   // Init and get the time
   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
@@ -600,6 +639,11 @@ void setup() {
 }
 
 void loop() {
+  // Try to reconnect to WiFi if disconnected
+  if (WiFi.status() != WL_CONNECTED) {
+    WiFi.begin(ssid, password);
+  }
+
   // Get current time
   timestamp = getFormattedTime();
   
@@ -664,19 +708,24 @@ void loop() {
   static unsigned long lastPostmanSend = 0;
   unsigned long currentMillis = millis();
   
-  if (currentMillis - lastPostmanSend >= 30000) {
+  if (currentMillis - lastPostmanSend >= 30000 && WiFi.status() == WL_CONNECTED) {
     Serial.println("Sending data to Postman...");
     sendToPostman();
     lastPostmanSend = currentMillis;
+  } else {
+    Serial.println("Skipping Postman send: WiFi not connected");
   }
-  
-  // Control water pumps based on switches
+
+  //control water pump based on water level
   WaterPumpControl();
+
   // Control fertiliser pump based on TDS value
   FertiliserControl();
+  // FertiliserTest(); // Test mode for fertiliser pump
+
   // Control Fan based on temperature and humidity
   AirflowControl();
 
   // Small delay between sensor readings
-  delay(5000);
+  delay(500);
 }
